@@ -78,7 +78,7 @@ printf 'SET name Tarun\nGET name\nEXPIRE name 60\nTTL name\n' | nc -q1 localhost
 
 Measured with the included load generator (`bench.cpp`, `run_bench.sh`, `summarize.sh`). Raw output is in `bench_run1.txt` to `bench_run3.txt`.
 
-- **Machine:** 2 cores | AMD EPYC 7763 64-Core Processor
+-- **Machine:** GitHub Codespaces VM, 2 cores (AMD EPYC 7763), 7.8 GiB RAM, Linux 6.8
 - **Setup:** `build/server` (Release, `-O2`), 8 workers, 100,000 key capacity, snapshots off. Client and server run on the same machine, over localhost.
 - **Workload:** 50% `SET` / 50% `GET`, 32-byte values, 20,000 requests per client, one request in flight per client, all clients start together.
 - **Method:** median of 3 runs per row.
@@ -92,6 +92,8 @@ Measured with the included load generator (`bench.cpp`, `run_bench.sh`, `summari
 | 16 | 49,318 | 240 | 230 | 348 |
 
 **What the numbers show:** Throughput rises from about 22,500 ops/s with 1 client to about 54,400 with 2 clients, then stays between roughly 48,000 and 52,000 up to 16 clients while latency keeps growing (average 36 µs at 2 clients, 164 µs at 8). The machine has 2 cores shared by the server and the load generator, and every command takes one global lock, so clients beyond the second mostly add waiting. At 16 clients, throughput is about the same as at 8, because the pool has only 8 workers and each connection holds a worker, so only 8 clients are served at a time while the other 8 wait.
+
+At 16 clients the maximum latency reached 3.39 s (the clients that waited for a worker) while p99 stayed at 348 µs, which is why the max matters alongside the percentiles.
 
 **Caveats:** the load generator shares the CPU with the server, so absolute numbers understate what the server could do alone, and they are not comparable to real Redis. Each client has one request in flight (no pipelining). These are a single-machine, relative picture of this design.
 

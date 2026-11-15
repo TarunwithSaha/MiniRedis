@@ -177,3 +177,58 @@ This is deliberate. Starting empty would let the next periodic save overwrite wh
 - Signals: Ctrl+C and `pkill` send catchable signals, so the server saves before exiting. `kill -9` can't be caught, so there is no final save.
 - The text format works only because keys contain no spaces and values contain no newlines. A binary, length-prefixed format would handle any bytes.
 - The loader validates the header, every line and the entry count, and refuses to start on a bad file instead of silently losing data.
+
+
+################################################################################################################
+
+Part 7: Benchmark, CMake build and README
+
+Machine: 2 cores, AMD EPYC 7763, 7.8 GiB RAM, Linux 6.8 (GitHub Codespaces VM).
+Workload: 50% SET / 50% GET, 32-byte values, 20,000 requests per client, one request in flight per client, snapshots off, `build/server` with `-O2`. Median of 3 runs.
+
+| Clients | Throughput (ops/s) | Avg (µs) | p95 (µs) | p99 (µs) |
+|---:|---:|---:|---:|---:|
+| 1 | 22,501 | 44 | 57 | 75 |
+| 2 | 54,368 | 36 | 44 | 60 |
+| 4 | 51,667 | 76 | 115 | 149 |
+| 8 | 47,964 | 164 | 238 | 529 |
+| 16 | 49,318 | 240 | 230 | 348 |
+
+Run 1, 16 clients: `avg=242 p50=151 p95=230 p99=348 max=3387632` (µs), 320,000 requests in 6.49 s.
+
+ Q1. Why does throughput stop growing after 2 clients, and what happened at 16 clients?
+
+With 1 client, throughput is only 22,501 ops/s because the server sits idle while the client builds and sends its next request. A second client fills that gap, and throughput jumps to 54,368. After that it stays flat (51,667 at 4 clients, 47,964 at 8) while the average latency keeps growing (36 µs at 2 clients, 164 µs at 8). The extra clients add waiting, not work. Two things cap the server. The machine has only 2 cores, and the benchmark client shares them with the server. And every command takes the one global `store_mutex`, so commands run one at a time no matter how many threads exist.
+
+The numbers are consistent with that. Throughput is roughly clients divided by average latency (2 / 36 µs is about 55,000, and 8 / 164 µs is about 49,000), so the benchmark measures what it claims to.
+
+At 16 clients, throughput (49,318) is about the same as at 8, because the pool has only 8 workers and each connection holds a worker until the client disconnects. Only 8 clients are served at once, and the other 8 wait in the queue. The `max` latency shows this directly: 3,387,632 µs (3.39 s), roughly how long the first 8 clients took to finish. The whole run took 6.49 s, about two waves of 8 clients. This is the Day 3 pool limit appearing in real numbers, and it is why real servers use `epoll` instead of one thread per connection.
+
+ Q2. Why report p95 and p99 and not just the average? What is odd about the 16-client row?
+
+An average blends all requests into one number, so a few terrible requests can hide behind many good ones, or drag the number up so it describes nobody's actual experience. Percentiles say what most requests see (p50), and what the slow ones see (p95, p99), which is what users notice.
+
+At 16 clients the average (240 µs) is larger than p95 (230 µs), which looks impossible at first. It happens because a tiny number of requests are enormously slow. The 8 clients that waited for a worker each had one request that took about 3.39 s. Those 8 requests are only 0.0025% of the 320,000 total, so they are invisible to p95 and p99. But 8 x 3.39 s is about 27 s of delay spread over 320,000 requests, which adds roughly 85 µs to the average. Without them the average would be near 157 µs, close to the p50 of 151. So the average was distorted by the tail, while p95 and p99 did not reveal the problem at all. Only `max` exposed it. The lesson is to report the median, the high percentiles and the max together, and to look at where the tail comes from.
+
+ Q3. What are the weaknesses of benchmarking with the client and server on the same machine, and how does the start barrier help?
+
+Weaknesses:
+- **Shared CPU:** the load generator and the server compete for the same 2 cores, so the client's own work slows the server. Absolute throughput understates what the server could do alone.
+- **Loopback is not a real network:** there is no real latency, packet loss or bandwidth limit, so network effects are missing.
+- **Noisy environment:** a shared cloud VM has neighbors and varying CPU speed, so runs differ. That is why I ran 3 times and used the median.
+- **Not comparable to other systems:** the numbers show the relative shape of this design (where it flattens, what saturates), not how it compares with real Redis.
+
+The barrier in `bench.cpp` makes every client connect first and then releases them all at the same moment, and the timer starts only after the release. Without it, clients would start at different times, so the early ones would run alone and the load would ramp up gradually, which understates contention. Thread creation and connection setup would also be counted inside the measured time. With the barrier, all N clients are active from the first request, so each row of the table really measures N concurrent clients. It does not fix the shared-CPU problem.
+
+ Q4. Why does `CMakeLists.txt` remove `-DNDEBUG`, and what would have happened to my tests?
+
+CMake's default Release flags include `-DNDEBUG`. That macro makes the compiler delete every `assert()` call. My tests use only `assert()` to check results. With `-DNDEBUG`, the test programs would still compile, run, and print "All LRU tests passed", but they would check nothing, because every assertion would be gone. That is dangerous because it looks like success. I saw why this matters in Day 4: when I removed `move_to_front` from `put()`, an assertion fired and caught the bug. With `NDEBUG` on, that same bug would have passed silently. So `CMakeLists.txt` sets Release flags to `-O2` explicitly, which keeps the optimization for the server and benchmark and keeps the asserts working in the tests.
+
+Summary
+
+- Peak throughput of about 54,000 ops/s at 2 clients, then flat. The ceiling comes from 2 cores shared with the load generator and the global lock.
+- The 8-worker pool shows up at 16 clients as a 3.39 s max latency, while p99 stays at 348 µs.
+- Percentiles and the max reveal things the average hides.
+- The CMake build keeps asserts enabled so the tests are real.
+
+################################################################################################################
