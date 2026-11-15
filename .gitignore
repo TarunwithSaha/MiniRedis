@@ -3,3 +3,4 @@ server_noreuse
 server_nolock
 core
 core.*
+lru_test

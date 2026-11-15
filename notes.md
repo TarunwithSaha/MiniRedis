@@ -12,6 +12,9 @@ The server is single-threaded and is stuck on the read() line inside the inner w
 
 When a server closes a connection, the OS keeps that port reserved for a short while (the TIME_WAIT state) to make sure stray packets from the old connection don’t confuse a new one. Without SO_REUSEADDR, restarting the server right after stopping it can fail with bind: Address already in use, even though no program is using the port. With SO_REUSEADDR on, the OS lets bind() succeed during that waiting period, so you can restart the server immediately during development. In Step 3 of your experiment, the version without the option failed to restart while the normal one worked.
 
+
+#############################################################################
+
 Part2
 
 1. Why the server can’t assume one read() equals one command
@@ -31,6 +34,7 @@ write() returns the number of bytes it actually wrote, and that can be fewer tha
 
 The >> operator stops at the first whitespace, so it reads only one word. For SET city New Delhi, iss >> value would store just New and silently lose Delhi. std::getline(iss, value) reads the entire rest of the line, so New Delhi is stored intact. After iss >> key, the stream is still sitting on the space before the value, so the code then skips leading spaces with find_first_not_of(' ') and takes the substring from there. The same check also catches SET onlykey, because with no value left on the line the code returns a “wrong number of arguments” error. In my test, GET city returned New Delhi, which confirms the whole value was kept.
 
+#############################################################################
 
 Part3:-
 
@@ -47,3 +51,31 @@ The cause is a data race. std::unordered_map is not thread-safe, and eight worke
 3. What limits the pool, and the fix
 
 “Each client connection occupies one worker thread for its entire lifetime, because handle_client blocks on read() until the client disconnects. So with 8 workers, at most 8 clients are served at once, and a ninth waits in the queue even if all 8 are idle. In my test with POOL_SIZE set to 2, the third client hung until one of the others disconnected. More threads help only partly, because each thread uses memory for its stack and the OS slows down with thousands of threads. The real fix is an event-driven design: use epoll so one thread (or a few) waits on many sockets at once and only does work on the ones with data ready. That’s how real Redis works. A smaller fix is to give each worker a short read timeout, but epoll is the proper answer.”
+
+
+
+#############################################################################
+Part 4:-
+
+1. Why a doubly linked list, not a singly linked list or an array
+
+An LRU cache has to move a key to the front on every use and remove the oldest key from the back, both in O(1). A doubly linked list can do this because each node knows both its neighbors. To unlink a node, I set prev->next = next and next->prev = prev, with no searching.
+
+Singly linked list: a node only knows its next neighbor, so to unlink a node in the middle I’d have to walk from the head to find the node before it. That’s O(n), and it would happen on every GET.
+Array or vector: moving an element to the front means shifting everything before it by one position, which is also O(n).
+
+I also used two sentinel nodes (head_ and tail_) so that inserting and removing never needs special cases for an empty list or for the first and last element.
+
+2. Why the hash map stores pointers to nodes, and what happens if it stores only keys
+
+The map goes from a key straight to that key’s node in the list, so on a GET I can find the node in O(1) and call move_to_front on it immediately. The two structures work as a pair: the map gives fast lookup, and the list gives fast reordering.
+
+If the map stored only keys (or only whether a key exists), I’d know the key is present but not where its node is, so I’d have to scan the list to find it. That makes every GET, SET update and DEL O(n). With a million keys, a cache that was meant to be fast would be scanning a million nodes per request. The pointer is what keeps all three operations O(1).
+
+3. Why GET now needs the same exclusive lock as SET
+
+In a plain hash map, a GET only reads, so concurrent readers are harmless. In an LRU cache, a GET also writes: it moves the node to the front, which rewrites four pointers (prev and next of the neighbors and of the node itself). If two threads ran GET at the same time, they could interleave those pointer updates and corrupt the list, leaving broken links, a node pointing at itself, or a freed node still reachable. That would cause crashes or lost entries, just like the Part 3 race condition.
+
+So a read-only (shared) lock would be unsafe here, and every command takes the full mutex. The cost is that all commands run one at a time, which limits throughput. Real Redis sidesteps this by executing commands on a single thread, and a multithreaded design could split the keys across several independent caches (sharding), each with its own lock, so threads only block each other when they touch the same shard
+
+Removing move_to_front from the update path made test_update_does_not_grow_and_refreshes fail, because updating a key didn’t refresh its recency, so the wrong key was evicted.

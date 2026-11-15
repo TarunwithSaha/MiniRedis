@@ -1,9 +1,9 @@
 #include <iostream>
 #include <sstream>
 #include <string>
-#include <unordered_map>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -13,17 +13,13 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include "lru.h"
 
 // ---------- The database and its lock ----------
-std::unordered_map<std::string, std::string> store;
+LRUCache* cache = nullptr;     // created in main() once we know the capacity
 std::mutex store_mutex;
-
-// Compile with -DNO_LOCK to remove the lock (for the race condition experiment)
-#ifdef NO_LOCK
-#define LOCK_STORE()
-#else
-#define LOCK_STORE() std::lock_guard<std::mutex> guard(store_mutex)
-#endif
+// Note: even GET changes the cache (it reorders the list), so every command
+// needs the full lock, not just writes.
 
 // ---------- Thread-safe printing ----------
 std::mutex log_mutex;
@@ -33,7 +29,6 @@ void log_line(const std::string& msg) {
 }
 
 // ---------- Thread pool ----------
-// A fixed set of worker threads that wait for tasks in a queue.
 class ThreadPool {
 public:
     explicit ThreadPool(size_t n) {
@@ -47,7 +42,7 @@ public:
             std::lock_guard<std::mutex> lk(m);
             tasks.push(std::move(task));
         }
-        cv.notify_one();   // wake up one sleeping worker
+        cv.notify_one();
     }
 
 private:
@@ -56,12 +51,11 @@ private:
             std::function<void()> task;
             {
                 std::unique_lock<std::mutex> lk(m);
-                // Sleep until the queue has a task (no busy waiting)
                 cv.wait(lk, [this] { return !tasks.empty(); });
                 task = std::move(tasks.front());
                 tasks.pop();
             }
-            task();   // run the task outside the lock
+            task();
         }
     }
 
@@ -100,8 +94,8 @@ std::string handle_command(const std::string& line) {
         if (key.empty() || start == std::string::npos)
             return "ERR wrong number of arguments for 'SET'";
         value = value.substr(start);
-        LOCK_STORE();
-        store[key] = value;
+        std::lock_guard<std::mutex> guard(store_mutex);
+        cache->put(key, value);
         return "OK";
     }
 
@@ -110,10 +104,10 @@ std::string handle_command(const std::string& line) {
         iss >> key;
         if (key.empty() || (iss >> extra))
             return "ERR wrong number of arguments for 'GET'";
-        LOCK_STORE();
-        auto it = store.find(key);
-        if (it == store.end()) return "(nil)";
-        return it->second;
+        std::lock_guard<std::mutex> guard(store_mutex);
+        std::string value;
+        if (!cache->get(key, value)) return "(nil)";
+        return value;
     }
 
     if (cmd == "DEL") {
@@ -121,13 +115,20 @@ std::string handle_command(const std::string& line) {
         iss >> key;
         if (key.empty() || (iss >> extra))
             return "ERR wrong number of arguments for 'DEL'";
-        LOCK_STORE();
-        return store.erase(key) ? "(integer) 1" : "(integer) 0";
+        std::lock_guard<std::mutex> guard(store_mutex);
+        return cache->erase(key) ? "(integer) 1" : "(integer) 0";
     }
 
     if (cmd == "DBSIZE") {
-        LOCK_STORE();
-        return "(integer) " + std::to_string(store.size());
+        std::lock_guard<std::mutex> guard(store_mutex);
+        return "(integer) " + std::to_string(cache->size());
+    }
+
+    if (cmd == "INFO") {
+        std::lock_guard<std::mutex> guard(store_mutex);
+        return "size=" + std::to_string(cache->size()) +
+               " capacity=" + std::to_string(cache->capacity()) +
+               " evictions=" + std::to_string(cache->evictions());
     }
 
     return "ERR unknown command '" + cmd + "'";
@@ -157,7 +158,18 @@ void handle_client(int client_fd) {
     close(client_fd);
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    // Usage: ./server [max_keys]   (default 1000)
+    size_t capacity = 1000;
+    if (argc > 1) {
+        capacity = std::strtoul(argv[1], nullptr, 10);
+        if (capacity == 0) {
+            std::cerr << "Usage: ./server [max_keys]  (max_keys must be at least 1)\n";
+            return 1;
+        }
+    }
+    cache = new LRUCache(capacity);
+
     const size_t POOL_SIZE = 8;
     ThreadPool pool(POOL_SIZE);
 
@@ -175,13 +187,9 @@ int main() {
     if (bind(server_fd, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
     if (listen(server_fd, 128) < 0) { perror("listen"); return 1; }
 
-#ifdef NO_LOCK
-    log_line("MiniRedis on port 6380 with " + std::to_string(POOL_SIZE) + " workers. WARNING: store lock is OFF");
-#else
-    log_line("MiniRedis on port 6380 with " + std::to_string(POOL_SIZE) + " workers. Store lock is ON");
-#endif
+    log_line("MiniRedis on port 6380, " + std::to_string(POOL_SIZE) +
+             " workers, max " + std::to_string(capacity) + " keys");
 
-    // The main thread only accepts connections and hands them to the pool
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
         if (client_fd < 0) { perror("accept"); continue; }
