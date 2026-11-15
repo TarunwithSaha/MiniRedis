@@ -1,2 +1,5 @@
 server
 server_noreuse
+server_nolock
+core
+core.*
