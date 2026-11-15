@@ -79,3 +79,32 @@ In a plain hash map, a GET only reads, so concurrent readers are harmless. In an
 So a read-only (shared) lock would be unsafe here, and every command takes the full mutex. The cost is that all commands run one at a time, which limits throughput. Real Redis sidesteps this by executing commands on a single thread, and a multithreaded design could split the keys across several independent caches (sharding), each with its own lock, so threads only block each other when they touch the same shard
 
 Removing move_to_front from the update path made test_update_does_not_grow_and_refreshes fail, because updating a key didn’t refresh its recency, so the wrong key was evicted.
+
+
+#############################################################################
+
+
+Part5:-
+
+1. Why both lazy and active expiry
+
+Lazy expiry checks a key’s deadline when a command touches it, so a command never returns a dead key. But it only runs on access, so a key nobody reads again stays in memory. Active expiry (the sweeper every 100 ms) frees that memory on its own, but it runs periodically, so it can’t be the correctness guarantee.
+
+Evidence: with ./server_nosweeper, I set a to expire in 3 seconds and waited 5. DBSIZE still returned 1 and INFO showed size=1 ttl_keys=1 expired_lazy=0 expired_active=0, so the dead key was still in memory. After GET a returned (nil), INFO showed size=0 ttl_keys=0 expired_lazy=1. With the sweeper on, an untouched key expired by itself (expired_active=1), and 1000 keys with the same deadline went from DBSIZE 1000 to 0 with expired_lazy=0 and ttl_keys=0.
+
+2. Why a min-heap, and what stale entries are
+
+Scanning every key’s expiry on every sweep is O(n), and almost all of it is wasted checking keys that aren’t due. A min-heap keeps the soonest deadline on top, so a sweep looks at the top in O(1) and pops only due entries in O(log n) each. The cost depends on how many keys expire, not how many exist.
+
+A heap can’t cheaply delete or update an entry in the middle. When a key is deleted, overwritten or re-EXPIREd, its old heap entry stays behind as a stale entry. The expires map is the source of truth. When the sweeper pops an entry, it acts only if expires still holds the same deadline (it->second == e.when), and discards it otherwise. That’s lazy deletion. The cost is that stale entries use memory until their time passes.
+
+3. Why the LRU needed an eviction callback
+
+The LRU removes keys by itself inside put() when it goes over capacity, but the expiry records live in main.cpp, outside the cache. Without the callback, an evicted key’s record would stay in expires: wasted memory, an inflated ttl_keys, and a bug if the same key name is later set again, because it would inherit a stale deadline. This is the same kind of bug as Part H, where an old deadline killed a newly set value.
+
+Evidence: with ./server 3, after SET a, EXPIRE a 100, then three more keys, INFO showed size=3 evictions=1 ttl_keys=0, and TTL a returned -2. The callback removed a’s expiry record with a itself. The callback runs inside put() while store_mutex is already held, so it must not lock again or the thread would deadlock on itself.
+
+
+With expires.erase(key) commented out in SET, SET k v1, EXPIRE k 20, SET k v2 left TTL k at 6, and GET k returned (nil): the old deadline deleted the newly written value. With the line restored, TTL k returned -1 and GET k returned v2.
+
+#############################################################################

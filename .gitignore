@@ -4,3 +4,7 @@ server_nolock
 core
 core.*
 lru_test
+
+
+lru_expiry_test
+server_nosweeper
