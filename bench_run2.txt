@@ -1,0 +1,39 @@
+Machine: 2 cores | AMD EPYC 7763 64-Core Processor
+Memory:  7.8Gi | Kernel: Linux 6.8.0-1070-azure
+Server:  8 workers, max 100000 keys, snapshots off | Workload: 50% SET / 50% GET, 20000 ops per client
+
+=== 1 clients ===
+clients=1  ops/client=20000  set=50%  keys/client=1000
+completed 20000 requests in 0.89 s
+throughput: 22501 ops/s
+latency us: avg=44  p50=43  p95=57  p99=75  max=1696
+errors: 0
+
+=== 2 clients ===
+clients=2  ops/client=20000  set=50%  keys/client=1000
+completed 40000 requests in 0.73 s
+throughput: 55069 ops/s
+latency us: avg=36  p50=34  p95=44  p99=60  max=2727
+errors: 0
+
+=== 4 clients ===
+clients=4  ops/client=20000  set=50%  keys/client=1000
+completed 80000 requests in 1.76 s
+throughput: 45486 ops/s
+latency us: avg=84  p50=73  p95=141  p99=299  max=3949
+errors: 0
+
+=== 8 clients ===
+clients=8  ops/client=20000  set=50%  keys/client=1000
+completed 160000 requests in 3.18 s
+throughput: 50263 ops/s
+latency us: avg=156  p50=151  p95=222  p99=294  max=2906
+errors: 0
+
+=== 16 clients ===
+clients=16  ops/client=20000  set=50%  keys/client=1000
+completed 320000 requests in 6.53 s
+throughput: 49016 ops/s
+latency us: avg=240  p50=149  p95=232  p99=423  max=3264924
+errors: 0
+

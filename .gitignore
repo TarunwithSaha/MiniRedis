@@ -12,3 +12,6 @@ server_nosweeper
 dump.snap
 dump.snap.tmp
 lru_order_test
+
+build/
+bench
