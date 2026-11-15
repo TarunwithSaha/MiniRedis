@@ -108,3 +108,72 @@ Evidence: with ./server 3, after SET a, EXPIRE a 100, then three more keys, INFO
 With expires.erase(key) commented out in SET, SET k v1, EXPIRE k 20, SET k v2 left TTL k at 6, and GET k returned (nil): the old deadline deleted the newly written value. With the line restored, TTL k returned -1 and GET k returned v2.
 
 #############################################################################
+
+Part 6: Snapshot persistence
+
+Q1. Why write to `dump.snap.tmp`, `fsync`, and then `rename`, instead of writing straight to `dump.snap`?
+
+Opening `dump.snap` for writing truncates it immediately. If the server crashed or the power failed halfway through, I would be left with a half-written file and would have destroyed the last good snapshot. So I write the new snapshot to `dump.snap.tmp` and leave the old `dump.snap` untouched. Only when the temp file is complete do I `rename` it over `dump.snap`. On the same filesystem, `rename` is atomic, so `dump.snap` is always either the complete old snapshot or the complete new one, never something in between.
+
+`fsync` matters because `write()` and `fclose()` only hand the data to the operating system's cache. After a power cut, the rename could survive while the file contents did not, leaving an empty or partial file under the final name. Calling `fsync` on the temp file forces the data onto the disk before the rename, and I also `fsync` the directory so the rename itself is durable. As a second safety net, the file ends with `END <count>`, and the loader refuses to start if that line is missing or the count is wrong.
+
+Q2. Why store each key's absolute expiry time instead of the seconds remaining?
+
+If I stored "300 seconds remaining", the countdown would restart from 300 on every load, and downtime would not count. A key that should have died while the server was off would come back to life. Storing the absolute time of death (milliseconds since the epoch) means the clock keeps running while the server is down.
+
+In memory I use `steady_clock`, which never jumps backwards but has no meaning across restarts. The file therefore uses `system_clock` (wall-clock time). At save time I convert the remaining time into an absolute time, and at load time I convert it back into a deadline for the new run. Keys that are already dead are skipped at save time and at load time.
+
+Evidence from my runs:
+- Before stopping the server, `cat dump.snap` showed `short 1794746252079 v` and `long 1794749212079 v` with `END 2`.
+- I stopped the server and waited 45 seconds with it off. On restart it printed `Loaded 1 keys from dump.snap (1 expired while down and skipped, cache holds 1)`.
+- `GET short` returned `(nil)`, so the dead key stayed dead.
+- `TTL long` returned `2147`, not 3000. `date +%s` printed `1794747103` and the saved deadline was `1794749212`, so about 2109 seconds remained, and downtime had counted against the key.
+- An earlier run showed that a key already dead at save time never reaches the file: the snapshot held only `long 1794746031946 v` with `END 1`.
+
+ Q3. Why copy the data under the lock and write it to disk after releasing the lock? What does `snapshot_mutex` prevent, and what does this design cost?
+
+Writing to disk is slow compared with memory. If I held `store_mutex` while writing, every client command would block until the disk finished. Copying all entries into a vector is memory-only and fast, so I hold the lock only for the copy, release it, and write the copy to disk. Because the copy happens under the lock, the snapshot is a consistent point in time, with no half-applied commands.
+
+`snapshot_mutex` ensures only one save runs at a time. `SAVE`, the periodic thread and the shutdown handler can all trigger a save, and two saves at once would write the same `dump.snap.tmp` file and corrupt it.
+
+The costs:
+- Memory briefly doubles, since the whole dataset is copied before writing.
+- The copy still holds the lock for O(n) time, so a very large database pauses clients briefly. Real Redis avoids this with `fork()` and copy-on-write.
+- Writes that happen during the disk write are not in this snapshot. I record the `dirty` counter at copy time (not at the end), so those writes stay counted as unsaved and the next save picks them up.
+
+ Evidence and experiments
+
+**Snapshot format (Part E).** After setting 3 keys and running `SAVE`, `cat dump.snap` showed:
+
+    MINIREDIS-SNAPSHOT 1
+    name -1 Tarun
+    city -1 New Delhi
+    temp 1794743964103 hello
+    END 3
+
+Keys without an expiry have `-1`, and keys are listed least recently used first so reloading restores the recency order. After Ctrl+C and a restart it printed `Loaded 3 keys`, and `GET name`, `GET city` and `DBSIZE` (3) all matched. `TTL temp` returned 150, not 300, because the deadline kept counting down while the server was off.
+
+**Crash versus graceful stop (Part F).**
+- `SET a 1`, `SAVE`, then `SET b 2` gave `INFO`: `saves=1 unsaved_changes=1`.
+- Before the crash, `cat dump.snap` contained only `a -1 1` and `END 1`.
+- After `pkill -9 -x server` (SIGKILL, which can't be caught), the restart printed `Loaded 1 keys`. `GET a` returned `1` and `GET b` returned `(nil)`. Key `b` was lost because it was written after the last snapshot.
+- With a graceful stop (Ctrl+C), the signal handler saved before exiting. After restarting, `GET a` returned `1` and `GET b` returned `2`, so nothing was lost.
+- Note: my first crash attempt was not valid. The server had been stopped with a catchable signal earlier, so it had saved `b` on exit. Only `kill -9` skips the final save, so the test had to start from a clean state to prove anything.
+
+**Periodic snapshots (Part F).** With `./server 1000 5`, `INFO` went from `saves=0 unsaved_changes=1` to `saves=1 unsaved_changes=0` by itself, and the log printed `Periodic snapshot saved`. After `pkill -9`, `GET x` still returned `1`.
+
+**Corrupt file (Part H).** After deleting the `END` line with `sed -i '$d' dump.snap`, the server refused to start:
+
+    ERROR: cannot load dump.snap: missing END line (file truncated?)
+    Fix or delete the file, then start again.
+
+This is deliberate. Starting empty would let the next periodic save overwrite whatever was still recoverable in the damaged file.
+
+**Regression and scale (Part I).** With `./server 100000 0`, `./load_test.sh` printed `Server says: (integer) 40000`, so the threading, LRU and expiry work from Days 3 to 5 still holds. After `SAVE`, `wc -l dump.snap` gave `40002` (a header, 40,000 entries and the END line). After a restart it printed `Loaded 40000 keys from dump.snap (0 expired while down and skipped, cache holds 40000)`, and `DBSIZE` returned `(integer) 40000`. All three test programs (`lru_test`, `lru_expiry_test`, `lru_order_test`) still pass.
+
+ Lessons and limitations
+
+- Snapshots lose whatever was written after the last save if the server crashes. The snapshot interval trades disk work against how much I can lose. Real Redis closes this gap with an append-only log (AOF).
+- Signals: Ctrl+C and `pkill` send catchable signals, so the server saves before exiting. `kill -9` can't be caught, so there is no final save.
+- The text format works only because keys contain no spaces and values contain no newlines. A binary, length-prefixed format would handle any bytes.
+- The loader validates the header, every line and the entry count, and refuses to start on a bad file instead of silently losing data.

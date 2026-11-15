@@ -43,7 +43,7 @@ public:
         return true;
     }
 
-    // Existence check that does NOT refresh recency (used by EXPIRE and TTL)
+    // Existence check that does NOT refresh recency
     bool contains(const std::string& key) const {
         return map_.count(key) > 0;
     }
@@ -71,10 +71,19 @@ public:
         return true;
     }
 
+    // Visit every entry from LEAST recently used to MOST recently used.
+    // Does not change recency. Replaying the entries into an empty cache with put(),
+    // in this order, rebuilds the same recency order (the last put ends up newest).
+    template <typename F>
+    void for_each_lru_to_mru(F fn) const {
+        for (Node* n = tail_->prev; n != head_; n = n->prev) fn(n->key, n->value);
+    }
+
     size_t size() const { return map_.size(); }
     size_t capacity() const { return capacity_; }
     size_t evictions() const { return evictions_; }
 
+    // Keys from most recently used to least recently used
     std::vector<std::string> keys_in_order() const {
         std::vector<std::string> keys;
         for (Node* n = head_->next; n != tail_; n = n->next) keys.push_back(n->key);
@@ -110,7 +119,7 @@ private:
     void evict_lru() {
         Node* victim = tail_->prev;
         if (victim == head_) return;
-        if (on_evict_) on_evict_(victim->key);   // tell the owner BEFORE the node is deleted
+        if (on_evict_) on_evict_(victim->key);
         unlink(victim);
         map_.erase(victim->key);
         delete victim;

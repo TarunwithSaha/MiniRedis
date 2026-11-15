@@ -8,3 +8,7 @@ lru_test
 
 lru_expiry_test
 server_nosweeper
+
+dump.snap
+dump.snap.tmp
+lru_order_test
